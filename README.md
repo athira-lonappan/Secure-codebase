@@ -1,90 +1,15 @@
-# 1. Supply Chain Security
+# Secure codebase
 
-End-to-end implementation of the seven layers in the design doc, plus one targeted addition — plpgsql security scanning for `scripts/psql/` — to close a coverage gap in the SAST layer.
-
-## Scope
-
-### Implementing as written
-
-- **Renovate** — tiered cooldown policy + Dependency Dashboard
-- **OSV-Scanner** — daily lockfile scan against vulnerability database
-- **Socket.dev** — real-time malicious-package detection on PRs
-- **Semgrep** — PR-time SAST on application code (TypeScript, Python, OWASP, AI packs)
-- **Gitleaks** — broader secret scanning on PRs + weekly history scan
-- **Trivy** — container image + IaC scanning in the GKE build pipeline
-- **SBOM** — CycloneDX-format manifest per release tag
-- **Alert routing** — Slack `#security-alerts` + auto-opened GitHub issues + weekly digest
-
-### Adding (new)
-
-- **plpgsql security scan** for `scripts/psql/` — audit + CI guardrail (~3 days)
-
-## Why add plpgsql security scanning
-
-### Gap
-
-- Semgrep covers application code via built-in rule packs (TypeScript, Python, OWASP, AI) but does not parse Postgres procedural language (plpgsql)
-- No equivalent open-source SAST tool exists for plpgsql
-- The `scripts/psql/` tree is invisible to the SAST layer as currently designed
-
-### Why it matters
-
-- `scripts/psql/` contains 2,373 `EXECUTE` statements and 1,498 `SECURITY DEFINER` declarations
-- `SECURITY DEFINER` functions run with the function owner's privileges and bypass Row-Level Security
-- An injection bug in such a function is a privilege-escalation bug, not a contained one
-
-### Concrete unsafe patterns already in the codebase
-
-- `copy_and_anonymized_data.sql` — concatenates `new_table_name`, `view_name`, `insert_query`, `batch_size`, `offset_count` directly into `EXECUTE` statements with no quoting
-- `chat_bot_process_query.sql:253`, `chat_bot_process_query_async.sql:245`, `main_query_processing.sql:124` — `EXECUTE ('SELECT ' || api_call_query)` adjacent to chatbot user-input flow
-
-## Deliverable
-
-Four artifacts get created in the repo:
-
-1. **Audit document** — a list of every plpgsql function in `scripts/psql/` that builds queries at runtime, with file path, line number, and one of three tags: ✅ safe, 🟡 needs review, 🔴 has injection risk
-2. **CI workflow** — runs automatically on every PR that touches a `.sql` file
-3. **Scanner script** — the small custom code that does the pattern matching (Semgrep doesn't parse plpgsql, so this is a ~50-line shell/python script)
-4. **Allowlist file** — known-safe patterns to skip, each with an inline comment explaining why
-
-The CI check flags three specific patterns:
-
-- `EXECUTE` statements built by string concatenation (e.g. `EXECUTE 'SELECT ' || user_input`)
-- `format()` calls used for SQL that skip the safe placeholders — `%I` for table/column names, `%L` for values
-- New functions declared `SECURITY DEFINER` (gets routed for explicit reviewer approval, since these run with elevated privileges)
-
-When the CI check fires, the developer sees: which file, which line, which pattern matched, and how to fix it. The PR cannot merge until the issue is resolved or added to the allowlist with justification.
-
-## Out of scope
-
-Fixing the existing issues that the audit document surfaces. That is a separate follow-up project — the same pattern the design doc uses for gitleaks history-scan findings (find first, fix as a separate workstream).
-
----
-
-# 2. Secret Scanning Hardening
-
-End-to-end implementation of the secret-scanning layer in the design doc — broader-coverage detection on new commits and weekly visibility into historical leaks.
-
-## Scope
-
-Implementing as written:
-
-- **Gitleaks CI workflow** — runs on every PR against the full diff, scans all file types
-- **Weekly history scan** — scheduled gitleaks run against the entire main branch history
-- **`.gitleaks.toml` allowlist** — suppresses known false positives identified in the initial history scan
-- **Existing `auto_env_secret_scan.yml` preserved** — LLM-based redundant check for `.env`-specific nuance (real value vs placeholder)
-
----
-
-# Phased Timeline
-
-| Phase | Timeline | Deliverables |
-|-------|----------|--------------|
-| 0 |  | Dependabot alerts enabled; Slack channel + webhook confirmed; reviewer team confirmed |
-| 1 |  | OSV-Scanner cron + Slack digest + issue automation + weekly posture digest + Socket.dev install |
-| 2 |  | Renovate setup with tiered cooldown; one-week dry-run; flip to PR mode |
-| 3 |  | Gitleaks + Semgrep + plpgsql audit + CI check |
-| 4 |  | Trivy in build pipeline; SBOM per release |
-| 5 |  | Documentation in `docs/specs/observability/`; SOC2 evidence bundling; retrospective |
-| 6 |  | Land `.github/workflows/gitleaks.yml` (PR + history scan modes); run initial full-history scan |
-| 7 |  | Triage initial history scan output → populate `.gitleaks.toml` allowlist; flip CI from warning-only to blocking |
+| # | Tool / Area | Existing today | What to add | Impact on the project | Priority | Time | Refinement after design doc review |
+|---|---|---|---|---|---|---|---|
+| 1 | **GCP Secret Manager** | Wired (`utils/secrets.py`) but underused. 67 `.env*` files still tracked in git; most services read from `.env` files at startup. | Make GSM the primary path via Cloud Run env-from-Secret-Manager refs. Rotate Tier S secrets into SM (PYLON_JWT_SECRET, DB strings, AWS keys, SUPABASE_SERVICE_ROLE_KEY). Build `dev-env.sh` for local dev. | Removes credentials from laptops + git history. Rotation becomes routine. Closes "leaked .env = prod takeover" attack class. | 🟠 P1 | 1–2 weeks |  |
+| 2 | **gitleaks** | Does not exist (verified — no pre-commit framework, no hooks). | Install as pre-commit hook + GitHub Action. Scans ALL file types (not just `.env`). | Prevents NEW secrets being committed anywhere. Pre-commit catches locally; CI is the backstop. | 🔴 P0 | 2 hrs | **CI only — drop pre-commit.** Pre-commit requires every developer to install and configure `pre-commit` locally; there is no way to enforce that uniformly across the team. A CI workflow runs on every PR automatically and is enforced via branch protection. Add a weekly scheduled scan of `main` history + a `.gitleaks.toml` allowlist for false positives. Keep `auto_env_secret_scan.yml` as a complementary LLM-based check for `.env` nuance. |
+| 3 | **Sentry — PII scrubbing** | Frontend + Node services strip emails. Python has only Epic-specific filter (no PII scrub). Meeting-recorder has NO `before_send` hook. `send_default_pii=True` (default) everywhere. | Centralized Python `before_send` PII scrub for python-server + meeting-recorder + document-server. Set `send_default_pii=False` in every init. | Stops customer PII (emails, request bodies, transcript fragments) flowing to a third-party SaaS. Closes GLBA / state-insurance / CCPA exposure. | 🔴 P0 | 3 hrs |  |
+| 4 | **Portkey — alerts + bypass closure** | Most chat-completion calls in the Python backend go through Portkey. Four classes of calls bypass it and call OpenAI directly: `analytics_service.py` (Ask AI), `voice_processor` (Whisper transcription), `utils/embedders/*` (embedding generation), and `.github/scripts/fix_pr_tldr.py` (PR-summary action). The user's email is sent as the `_user` metadata field. There is some monitoring code in `sentinel-server` (a probe for elevated model error rates) but its API key is not populated in any environment, so it isn't running. No cost-ceiling alerts, no unusual-usage anomaly alerts. | (1) **Populate `PORTKEY_ANALYTICS_API_KEY` and configure cost-ceiling + anomaly alerts on the Portkey dashboard — route alerts to Slack.** (2) **Migrate the bypass services (analytics, Whisper, embeddings, GH Actions) to route through Portkey so all LLM traffic is observable.** (3) **Hash the user email before putting it in the `_user` metadata field.** | Detects leaked AI key abuse within minutes (a $500 alert instead of a $47K invoice). Makes all LLM spend visible in one place. Stops customer PII being exported to a third-party SaaS. | 🔴 P0 alerts / 🟠 P1 bypass | 2 hrs + ~1 week |  |
+| 5 | **GCP Cloud Audit Logs — alerts** | Logs collected by default (SM access, IAM, Cloud Run) and stored in audit-log buckets. Zero alert rules wired (`grep` for `google_monitoring_alert_policy` / `google_logging_metric` returns no files). Only existing dashboards are KPI/performance-focused (`nexus-api-kpi-*`). Supabase logs collected but not forwarded for security signal monitoring. | Three alert rules: (1) SM accessed from a new service-account principal or off-hours from a known one, (2) **same service-role principal touching multiple tenant projects in a short window** (the project-per-tenant equivalent of cross-tenant access), (3) sensitive-table query spikes above baseline. Route to Slack. | First warning of stolen credentials or unusual access patterns. Dev team finds out from Slack within minutes, not from a customer ticket or billing surprise weeks later. Free — uses logs already collected. | 🟠 P1 | 4 hrs | Reuse the **Slack `#security-alerts` channel + GitHub issue automation** built for vulnerability alerts. Same routing infrastructure; different detection rules. |
+| 6 | **CODEOWNERS + lockfiles** | CODEOWNERS exists with ~58 paths (`.claude/`, `.github/workflows/`). Lockfiles NOT covered. `scripts/psql/` NOT covered. Branch protection enforcement unverified. | Add `package-lock.json`, `poetry.lock`, `scripts/psql/` to CODEOWNERS. Verify branch protection requires CODEOWNERS approval. | Every dep change requires human review (defeats npm-worm-class supply chain). Every schema change requires DBA review. | 🔴 P0 | 30 min | Lockfile CODEOWNERS complements Renovate — Renovate handles automated dep updates with cooldown; CODEOWNERS adds explicit human review on every lockfile diff. Also add `.gitleaks.toml` and the new `plpgsql_lint.yml` workflow files to the CODEOWNERS list. |
+| 7 | **Prompt-injection defenses** | Untrusted user content concatenated directly into prompts (no trust markers; structural `<mention>` tags exist but no defensive system instruction). RAG ingest does not scan for injection payloads. Mutating agent tools have no central allowlist. | Wrap untrusted content in `<untrusted_data>` tags + system instruction. Scan documents at ingest for injection patterns. Per-agent tool allowlist; user confirmation for mutating actions. | Defends against direct + indirect prompt injection (the witness.ai #5 attack). Customer PDFs can no longer steer the AI into unauthorized actions. | 🟠 P1 | ~2 weeks | **Explicitly out of scope of the design doc** — quoted: "LLM-specific prompt-injection runtime defenses (Lakera / Rebuff) — separate design, scoped to AI feature owners." This is a standalone AI-trust workstream, owned by whoever maintains the AI agent code. |
+| 8 | **CodeQL / SAST** | No static application security testing. AI-driven vulnerability scanners can find bugs before we do. | Enable GitHub CodeQL (free for public / GHAS for private). Catches SQL injection, XSS, unsafe deserialization, hardcoded creds, weak crypto. | Defends against AI-driven vulnerability discovery (witness.ai #6). Bugs a free tool would catch are slipping through today. | 🟠 P1 | 1–2 days | **Swap CodeQL → Semgrep** (faster on JS/TS, has AI rule pack `p/ai`, OWASP Top 10 covers SQLi / XSS / etc.). Plus **custom plpgsql addition** — Semgrep doesn't parse plpgsql, so `scripts/psql/` (2,373 `EXECUTE` statements, 1,498 `SECURITY DEFINER` declarations) is invisible. Add a 3-day audit + CI guardrail for unsafe plpgsql patterns. |
+| 9 | **Rate limiting** | We have basic per-IP rate limiting at the edge via Cloud Armor (500 req/min default, 200 req/min on login endpoints). But it's gated by a Terraform feature flag (`enable_phase2`) — might not even be active in prod. No per-tenant limits (so one person across multiple IPs evades it). No tighter caps on expensive AI endpoints (one Ask-AI call can cost real LLM money). No alerts fire when limits are hit. No rate-limit code at the application level — the per-tenant DB semaphores that do exist are for fair queuing, not abuse detection. | (1) Verify Cloud Armor rules are actually on in production. (2) Add per-tenant limits, not just per-IP. (3) Tighter caps specifically on AI / expensive endpoints. (4) Slack alerts when someone hits a limit. | Without this, a stolen login or runaway script can hammer AI endpoints — burning LLM budget and degrading service — and we find out from the bill or a customer complaint, not in real time. Also throttles abuse of `public_share` and runaway tool calls. | 🟠 P1 | 2–3 days |  |
+| 10 | **Replace `exec()` in workflow router** | `apps/product-backend/python-server/src/utils/tools/workflows/router.py:503` runs Python source code from a database column. Anyone who can write to that table can execute arbitrary code on the server. | Replace with explicit registry of workflow classes defined in code. DB stores a workflow KEY + validated params; server looks up the class. No more code-from-data. | Closes app-layer Remote Code Execution. Once an attacker has RCE, every other defense is bypassed. This is the single worst code finding. | 🔴 P0 | 3–5 days |  |
+| 11 | **Enable Dependabot with cooldown** | No dependency auditing. No Dependabot, no Renovate, no npm audit, no pip-audit. Vulnerable packages slip in silently. | Enable Dependabot (free, GitHub-native) with `cooldown: { default-days: 3 }`. Add `pip-audit` + `npm audit` steps to CI. | Defends against npm-worm-class attacks (Shai-Hulud etc.). The cooldown specifically prevents auto-pulling brand-new malicious package versions during their live window. | 🟠 P1 | 1 day | **Use Renovate instead of Dependabot** — Renovate has per-package, per-update-type cooldown granularity (Dependabot's cooldown is coarse), a Dependency Dashboard single-issue UI, and grouped PRs. Tiered cooldown: patches 14d / minor 30d / major 180d, with CVE-bypass fast-path. **Pair with OSV-Scanner** (daily cron, scans lockfiles against `osv.dev`) and **Socket.dev** (real-time malicious-package detection on PRs — catches issues before a CVE is filed). **Enable Dependabot alerts** (free, separate signal source) as a third feed. |
