@@ -1,4 +1,4 @@
-# Supply Chain Security
+# 1. Supply Chain Security
 
 End-to-end implementation of the seven layers in the design doc, plus one targeted addition — plpgsql security scanning for `scripts/psql/` — to close a coverage gap in the SAST layer.
 
@@ -61,7 +61,7 @@ Fixing the existing issues that the audit document surfaces. That is a separate 
 
 ---
 
-# Secret Scanning Hardening
+# 2. Secret Scanning Hardening
 
 End-to-end implementation of the secret-scanning layer in the design doc — broader-coverage detection on new commits and weekly visibility into historical leaks.
 
